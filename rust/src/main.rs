@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::error::Error;
+use std::future::Future;
 use std::net::TcpStream;
 use std::pin::Pin;
 use std::process::ExitCode;
@@ -19,12 +20,6 @@ use tracing::{error, info, warn};
 type INTERVAL = i8;
 type BoxDynError = Box<dyn Error>;
 type WSSWrite = SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>;
-type ChannelHandler = for<'a> fn(
-  text: &'a str,
-  json: Value,
-  producer: FutureProducer,
-) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-type ChannelHandlerMap = HashMap<&'static str, ChannelHandler>;
 
 const KRAKEN_WS_URL: &str = "wss://ws.kraken.com/v2";
 const SYMBOLS: [&str; 1] = ["XRP/USD"];
@@ -80,48 +75,31 @@ async fn ohlc_subscribe(write: &mut WSSWrite, interval: INTERVAL) -> Result<(), 
   Ok(())
 }
 
-macro_rules! channel_handler_async {
-  ($func:expr) => {
-    (|text: &str, json: Value, producer: FutureProducer| {
-      (Box::pin($func(&text, json, producer)))
-    }) as ChannelHandler
-  };
+
+async fn ch_ticker(text: &str, json: Value, producer: &FutureProducer) {
+// let record = FutureRecord::to("dj.kraken.ticker")
+//   .payload(&text)
+//   .key("something");
+// let delivery_status = producer.send(record, Duration::from_secs(0)).await;
 }
 
-async fn ch_ignore<'a>(_: & 'a str, _: Value, _: FutureProducer) {}
-
-// async fn ch_just_log(text: &str, _: Value, _: FutureProducer) {
-//   info!("Received message: {}", &text[..text.len().min(200)]);
-// }
-
-// async fn ch_ticker(text: &str, json: Value, producer: FutureProducer) {
-  // let record = FutureRecord::to("dj.kraken.ticker")
-  //   .payload(&text)
-  //   .key("something");
-  // let delivery_status = producer.send(record, Duration::from_secs(0)).await;
-// }
-
-// async fn ch_ohlc(_text: &str, json: Value, _: FutureProducer) {}
-
-fn create_channel_handler_map() -> ChannelHandlerMap {
-  let mut map: HashMap<&str, ChannelHandler> = HashMap::new();
-  // map.insert("status", channel_handler_async!(ch_just_log));
-  map.insert("heartbeat", channel_handler_async!(ch_ignore));
-  // map.insert("ticker", channel_handler_async!(ch_ticker));
-  // map.insert("ohlc", channel_handler_async!(ch_ohlc));
-  map
+async fn ch_ohlc(_text: &str, json: Value, _: &FutureProducer) {
+  
 }
 
 async fn handle_message(
   text: &str,
-  channel_handler_map: &ChannelHandlerMap,
   producer: &FutureProducer,
 ) -> Option<()> {
-  info!("Received message: {}", &text[..text.len().min(200)]);
   let json = serde_json::from_str::<Value>(&text).ok()?;
   let channel = json.get("channel").and_then(|v| v.as_str()).unwrap_or("");
-  let func = channel_handler_map.get(channel)?;
-  func(text, json, producer.clone()).await;
+  match channel {
+    "ticker" => ch_ticker(text, json, producer).await,
+    "ohlc" => ch_ohlc(text, json, producer).await,
+    "heartbeat" => {},
+    "status" => info!("Status received"),
+    other => info!("Unknown message channel {other}")
+  };
   Some(())
 }
 
@@ -129,7 +107,6 @@ async fn establish_kraken_connection(
   interval: INTERVAL,
   with_ticker: bool,
   producer: &FutureProducer,
-  channel_handler_map: &ChannelHandlerMap,
 ) -> Result<(), BoxDynError> {
   let (wsclient, _response) = connect_async(KRAKEN_WS_URL).await?;
   let (mut write, mut read) = wsclient.split();
@@ -140,7 +117,7 @@ async fn establish_kraken_connection(
   while let Some(msg) = read.next().await {
     match msg {
       Ok(Message::Text(text)) => {
-        handle_message(&text, channel_handler_map, producer).await;
+        handle_message(&text, producer).await;
       }
       Ok(Message::Close(_)) => {}
       Ok(_) => {}
@@ -153,9 +130,8 @@ async fn establish_kraken_connection(
 }
 
 async fn establish_kraken_connections(producer: FutureProducer) {
-  let channel_handler_map = create_channel_handler_map();
   let _wsclients = INTERVALS.iter().enumerate().map(|(idx, interval)| {
-    establish_kraken_connection(*interval, idx == 0, &producer, &channel_handler_map)
+    establish_kraken_connection(*interval, idx == 0, &producer)
   });
 }
 
