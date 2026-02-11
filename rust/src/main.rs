@@ -42,12 +42,29 @@ fn create_producer(brokers: String) -> Result<FutureProducer, BoxDynError> {
   Ok(producer)
 }
 
-async fn ticker_subscribe(mut write: WSSWrite) -> Result<(), BoxDynError> {
+async fn ticker_subscribe(write: & mut WSSWrite) -> Result<(), BoxDynError> {
   let msg = serde_json::json!({
     "method": "subscribe",
     "params": {
       "channel": "ticker",
-      "symbol": SYMBOLS
+      "symbol": SYMBOLS,
+      "event_trigger": "trades",
+      "snapshot": true
+    }
+  });
+  let json = serde_json::to_string(&msg)?;
+  let _ = write.send(Message::Text(Into::into(json))).await?;
+  Ok(())
+}
+
+async fn ohlc_subscribe(write: & mut WSSWrite, interval: INTERVAL) -> Result<(), BoxDynError> {
+  let msg = serde_json::json!({
+    "method": "subscribe",
+    "params": {
+      "channel": "ticker",
+      "symbol": SYMBOLS,
+      "interval": interval,
+      "snapshot": false
     }
   });
   let json = serde_json::to_string(&msg)?;
@@ -67,19 +84,19 @@ macro_rules! channel_handler_async {
   };
 }
 
-async fn ch_ignore(text: Utf8Bytes) {
+async fn ch_ignore(_text: Utf8Bytes) {
   ()
 }
 
-async fn ch_just_log(text: Utf8Bytes) {
+async fn ch_just_log(_text: Utf8Bytes) {
   ()
 }
 
-async fn ch_ticker(text: Utf8Bytes) {
+async fn ch_ticker(_text: Utf8Bytes) {
   ()
 }
 
-async fn ch_ohlc(text: Utf8Bytes) {
+async fn ch_ohlc(_text: Utf8Bytes) {
   ()
 }
 
@@ -104,11 +121,12 @@ async fn handle_message(text: Utf8Bytes, channel_handler_map: &ChannelHandlerMap
 }
 
 async fn establish_kraken_connection(interval: INTERVAL, with_ticker: bool, producer: &FutureProducer, channel_handler_map: &ChannelHandlerMap) -> Result<(), BoxDynError> {
-  let (wss, response) = connect_async(KRAKEN_WS_URL).await?;
-  let (write, mut read) = wss.split();
+  let (wss, _response) = connect_async(KRAKEN_WS_URL).await?;
+  let (mut write, mut read) = wss.split();
   if with_ticker {
-    ticker_subscribe(write).await?;
+    ticker_subscribe(&mut write).await?;
   }
+  ohlc_subscribe(&mut write, interval).await?;
   while let Some(msg) = read.next().await {
     match msg {
       Ok(Message::Text(text)) => {
