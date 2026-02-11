@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use futures_util::stream::SplitSink;
 use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
-use rdkafka::producer::{FutureProducer};
+use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde_json::Value;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Utf8Bytes;
@@ -16,11 +16,15 @@ use std::error::Error;
 use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream};
 use futures_util::{SinkExt, StreamExt};
 
+type INTERVAL = i8;
+type BoxDynError = Box<dyn Error>;
+type WSSWrite = SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>;
+type ChannelHandler = fn(text: Utf8Bytes, json: Value, producer: FutureProducer) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+type ChannelHandlerMap = HashMap<&'static str, ChannelHandler>;
+
 const KRAKEN_WS_URL: &str = "wss://ws.kraken.com/v2";
 const SYMBOLS: [&str; 1] = ["XRP/USD"];
-type INTERVAL = i8;
 const INTERVALS: [INTERVAL; 3] = [1, 15, 60];
-type BoxDynError = Box<dyn Error>;
 
 fn get_brokers() -> Result<String, BoxDynError> {
   match env::var("KAFKA_BROKERS") {
@@ -72,33 +76,26 @@ async fn ohlc_subscribe(write: & mut WSSWrite, interval: INTERVAL) -> Result<(),
   Ok(())
 }
 
-type WSSWrite = SplitSink<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Message>;
-
-type ChannelHandler = fn(text: Utf8Bytes) -> Pin<Box<dyn Future<Output = ()> + Send>>;
-
-type ChannelHandlerMap = HashMap<&'static str, ChannelHandler>;
-
 macro_rules! channel_handler_async {
   ($func:expr) => {
-    |text: Utf8Bytes| Box::pin($func(text)) as Pin<Box<dyn Future<Output = ()> + Send>>
+    |text: Utf8Bytes, json: Value, producer: FutureProducer| Box::pin($func(text, json, producer)) as Pin<Box<dyn Future<Output = ()> + Send>>
   };
 }
 
-async fn ch_ignore(_text: Utf8Bytes) {
-  ()
+async fn ch_ignore(_: Utf8Bytes, _: Value, _: FutureProducer) {}
+
+async fn ch_just_log(text: Utf8Bytes, _: Value, _: FutureProducer) {
+  info!("Received message: {}", &text[..text.len().min(200)]);
 }
 
-async fn ch_just_log(_text: Utf8Bytes) {
-  ()
+async fn ch_ticker(text: Utf8Bytes, json: Value, producer: FutureProducer) {
+  // let record = FutureRecord::to("dj.kraken.ticker")
+  //   .payload(&text)
+  //   .key("something");
+  // let delivery_status = producer.send(record, Duration::from_secs(0)).await;
 }
 
-async fn ch_ticker(_text: Utf8Bytes) {
-  ()
-}
-
-async fn ch_ohlc(_text: Utf8Bytes) {
-  ()
-}
+async fn ch_ohlc(_text: Utf8Bytes, json: Value, _: FutureProducer) {}
 
 fn create_channel_handler_map() -> ChannelHandlerMap {
   let mut map: HashMap<&str, ChannelHandler> = HashMap::new();
@@ -109,20 +106,20 @@ fn create_channel_handler_map() -> ChannelHandlerMap {
   map
 }
 
-async fn handle_message(text: Utf8Bytes, channel_handler_map: &ChannelHandlerMap) -> Option<()>{
+async fn handle_message(text: Utf8Bytes, channel_handler_map: &ChannelHandlerMap, producer: &FutureProducer) -> Option<()>{
   info!("Received message: {}", &text[..text.len().min(200)]);
   let json = serde_json::from_str::<Value>(&text).ok()?;
   let channel = json.get("channel")
     .and_then(|v| v.as_str())
     .unwrap_or("");
   let func = channel_handler_map.get(channel)?;
-  func(text).await;
+  func(text, json, producer.clone()).await;
   Some(())
 }
 
 async fn establish_kraken_connection(interval: INTERVAL, with_ticker: bool, producer: &FutureProducer, channel_handler_map: &ChannelHandlerMap) -> Result<(), BoxDynError> {
-  let (wss, _response) = connect_async(KRAKEN_WS_URL).await?;
-  let (mut write, mut read) = wss.split();
+  let (wsclient, _response) = connect_async(KRAKEN_WS_URL).await?;
+  let (mut write, mut read) = wsclient.split();
   if with_ticker {
     ticker_subscribe(&mut write).await?;
   }
@@ -130,7 +127,7 @@ async fn establish_kraken_connection(interval: INTERVAL, with_ticker: bool, prod
   while let Some(msg) = read.next().await {
     match msg {
       Ok(Message::Text(text)) => {
-        handle_message(text, channel_handler_map).await;
+        handle_message(text, channel_handler_map, producer).await;
       }
       Ok(Message::Close(_)) => {
 
@@ -148,7 +145,7 @@ async fn establish_kraken_connection(interval: INTERVAL, with_ticker: bool, prod
 
 async fn establish_kraken_connections(producer: FutureProducer) {
   let channel_handler_map = create_channel_handler_map();
-  let wss =
+  let _wsclients =
     INTERVALS.iter().enumerate()
     .map(|(idx, interval)|establish_kraken_connection(*interval, idx == 0, &producer, &channel_handler_map));
 }
