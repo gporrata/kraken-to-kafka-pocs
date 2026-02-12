@@ -1,21 +1,14 @@
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use rdkafka::client::DefaultClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::env;
 use std::error::Error;
-use std::future::Future;
-use std::net::TcpStream;
-use std::pin::Pin;
-use std::process::ExitCode;
+use std::time::Duration;
 use tokio_tungstenite::MaybeTlsStream;
-use tokio_tungstenite::tungstenite::Utf8Bytes;
-use tokio_tungstenite::tungstenite::handshake::server::create_response;
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 type INTERVAL = i8;
 type BoxDynError = Box<dyn Error>;
@@ -76,15 +69,19 @@ async fn ohlc_subscribe(write: &mut WSSWrite, interval: INTERVAL) -> Result<(), 
 }
 
 
-async fn ch_ticker(text: &str, json: Value, producer: &FutureProducer) {
-// let record = FutureRecord::to("dj.kraken.ticker")
-//   .payload(&text)
-//   .key("something");
-// let delivery_status = producer.send(record, Duration::from_secs(0)).await;
+async fn ch_ticker(text: &str, producer: &FutureProducer) {
+  let record = FutureRecord::to("dj.kraken.ticker")
+    .payload(text)
+    .key("something");
+  let _ = producer.send(record, Duration::from_secs(0)).await;
 }
 
-async fn ch_ohlc(_text: &str, json: Value, _: &FutureProducer) {
-  
+async fn ch_ohlc(text: &str, producer: &FutureProducer) {
+  let record = FutureRecord::to("dj.kraken.ohlc")
+    .payload(text)
+    .key("something");
+  let _ = producer.send(record, Duration::from_secs(0)).await;
+
 }
 
 async fn handle_message(
@@ -94,8 +91,8 @@ async fn handle_message(
   let json = serde_json::from_str::<Value>(&text).ok()?;
   let channel = json.get("channel").and_then(|v| v.as_str()).unwrap_or("");
   match channel {
-    "ticker" => ch_ticker(text, json, producer).await,
-    "ohlc" => ch_ohlc(text, json, producer).await,
+    "ticker" => ch_ticker(text, producer).await,
+    "ohlc" => ch_ohlc(text, producer).await,
     "heartbeat" => {},
     "status" => info!("Status received"),
     other => info!("Unknown message channel {other}")
