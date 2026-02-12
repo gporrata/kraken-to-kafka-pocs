@@ -1,5 +1,4 @@
 # kraken-to-kafka-pocs
 
-Comparision of writing a websocket client to read prices
-from kraken and feed them to kafka topcis. Using the ideas hear to decide
-where to use Rust, Go, C++.
+Comparision of writing a websocket clients to read prices
+from kraken and feed them to kafka topics.
